@@ -1,0 +1,12 @@
+#!/bin/sh
+
+# Don't stop UI processes to give the opportunity to retry later
+# if the gateway reboot fails.
+
+logger -t safe-reboot-gateway "Rebooting the gateway"
+sync
+
+# This will send the gateway reset command several times, since UDP is unreliable.
+gw-diag SHUTOFF_RAILS_AND_REBOOT
+
+# if the gateway could power down the rails and reboot, power will be pulled from the cid/ice here.

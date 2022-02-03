@@ -1,0 +1,5 @@
+PlatformPath         "arm/linux/streetdirector/tesla-armv7ahf-vfp-gpt-linux-gnueabi_006"
+Baseline             "svn#http://subversion/svn/navi-db/3Soft-Navi/tags/ub/8.8/TESLA-21/8.8-TESLA-21_P15324_16345_113362/Projects@630148"
+BuildNumber          "8.8-TESLA-21_P15324_16345_113362"
+MapFormat            "NDS"
+CMake                "2.8.12.2"

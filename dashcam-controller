@@ -1,0 +1,222 @@
+#!/bin/bash
+
+set -ue
+
+termination_request=0
+
+term_handler() {
+  termination_request=1
+}
+
+# we need to determine the APE board version eligibility (>=2.5)
+# return 0 if the test passes
+check_capable_hw() {
+  ape_hw_file=/var/etc/dashw
+  # empty is pre-DAS
+  # 0 is DAS0 (harnessed for DAS2.0, but no DAS ECU installed)
+  # 1 is DAS1
+  # 2 is DAS2.0
+  # 3 is DAS2.5
+  # 4 is DAS3.0
+  # /var/etc/dashw doesn't exist on Model 3
+
+  # return 0 on Model 3, as this file doesn't exist
+  [ -f "${ape_hw_file}" ] || return 0
+
+  ape_hw_ver=$(<"${ape_hw_file}")
+
+  # return 1 on pre-DAS, as this file is empty
+  [ -z "${ape_hw_ver}"  ] && return 1
+
+  # return 0 on any HW2.5 or greater DAS
+  [ "${ape_hw_ver}" -gt 2 ]
+}
+
+fix_date() {
+  to_fix="${1}"
+  now=$(date +%s)
+  touch "--date=@${now}" "${to_fix}"
+}
+
+trap term_handler TERM
+
+vid_dir=/home/dashcam/TeslaCam
+run_dir=/var/run/dashcam
+tmp_dir=/tmp/dashcam
+pid_file="${run_dir}/pid"
+state_file="${run_dir}/state"
+pause_file="${tmp_dir}/pause"
+save_file="${tmp_dir}/save"
+scratch_file="${tmp_dir}/scratch.mp4"
+storage_err_file=/tmp/dashcam_storage_error
+writable_file="${vid_dir}/.writable"
+log_tag=dashcam
+
+recent_prefix=recent
+saved_prefix=saved
+
+dv_url="http://127.0.0.1:4070/_data_set_value_request_?name=GUI_dashCamState&value="
+ui_unavailable="/usr/bin/curl -s "${dv_url}Unavailable""
+ui_available="/usr/bin/curl -s "${dv_url}Available""
+ui_recording="/usr/bin/curl -s "${dv_url}Recording""
+ui_saved="/usr/bin/curl -s "${dv_url}Saved""
+ui_full="/usr/bin/curl -s "${dv_url}NoSpace""
+
+minimum_required_mb=100
+
+tegra_workaround=0
+while getopts ":t" opt; do
+  case ${opt} in
+    t ) tegra_workaround=1
+      ;;
+    \? ) echo "Usage: dashcam_controller [-t]"
+      ;;
+  esac
+done
+
+buffers=8192
+
+# Wrap the H.264 payload in a container and a buffer limit to prevent rogue processes lasting forever.
+capture_cmd="gst-launch-1.0 -e -v udpsrc port=9898 num-buffers=${buffers} \
+                    ! queue ! h264parse ! mp4mux ! filesink location="
+
+if [ "$tegra_workaround" -eq "1" ] ; then
+  logger -t "${log_tag}" "Note: Tegra workaround is enabled."
+  export GST_PLUGIN_PATH=/usr/mametree/usr/lib/gstreamer-1.0/:/usr/mametree/usr/lib/
+  capture_cmd="/usr/mametree/lib/ld-linux.so.3 --library-path /usr/mametree/lib:/usr/mametree/usr/lib/ /usr/mametree/usr/bin/${capture_cmd}"
+fi
+
+state=waiting
+
+if check_capable_hw; then
+  logger -t "${log_tag}" "Found valid autopilot hardware for dashcam."
+else
+  logger -t "${log_tag}" "Did not find valid autopilot hardware for dashcam."
+  ${ui_unavailable} || true
+  # do not quit now, wait for the term signal from the init system
+  while [ "${termination_request}" -ne "1" ]; do
+    sleep 3
+  done
+  logger -t "${log_tag}" "Received TERM - exiting without starting dashcam."
+  exit 143 #128+15 -- SIGTERM
+fi
+
+
+logger -t "${log_tag}" "starting state machine."
+${ui_unavailable} || true
+mkdir -p -m 0777 "${tmp_dir}"
+
+while true
+do
+  mkdir -p "${run_dir}"
+  old_state="$state"
+
+  case "${state}" in
+  waiting)
+    if [ -d "${vid_dir}" ]
+    then
+      state=checking
+    else
+      state=waiting
+      if [ -f "$storage_err_file" ]
+      then
+        ${ui_full} || true
+      else
+        ${ui_unavailable} || true
+      fi
+      sleep 1
+    fi
+  ;;
+  checking)
+    if [ -d "${vid_dir}" ] && [ "$(df -m -P "${vid_dir}" | tail -n 1 | awk '{ print $4 }')" -gt "${minimum_required_mb}" ] && touch "${writable_file}"
+    then
+      rm "${writable_file}"
+      state=starting
+    else
+      state=waiting
+      if [ -d "${vid_dir}" ]
+      then
+        ${ui_full} || true
+      else
+        ${ui_unavailable} || true
+      fi
+      sleep 1
+    fi
+  ;;
+  paused)
+    if [ -f "${pause_file}" ]
+    then
+      state=paused
+      ${ui_available} || true
+      sleep 1
+    else
+      state=checking
+    fi
+  ;;
+  starting)
+    TZ="$(/usr/local/bin/lv GUI_timeZoneId | tr -d '"')"
+    export TZ
+    this_filename="${vid_dir}/$(date +${recent_prefix}-front-%Y-%m-%d_%H-%M.mp4)"
+    if [ -d "${vid_dir}" ]
+    then
+      if [ -f "${save_file}" ]
+      then
+        while IFS= read -r -d '' to_save
+        do
+          dest="$(echo "${to_save}" | sed s/${recent_prefix}/${saved_prefix}/)"
+          mv "${to_save}" "${dest}"
+          fix_date "${dest}"
+          state=killing
+        done < <(find "${vid_dir}" -name "${recent_prefix}*" -type f -mmin -10 -print0)
+        rm -f "${save_file}"
+        ${ui_saved} || true
+        sync
+      fi
+      ${capture_cmd}"${scratch_file}" > /dev/null 2>&1 &
+      pid=$!
+      logger -t ${log_tag} "spawned pipeline with pid ${pid}."
+      echo "${pid}" > "${pid_file}"
+      state=recording
+      ${ui_recording} || true
+    else
+      state=waiting
+    fi
+  ;;
+  recording)
+    starttime=$(stat -c %Y "${pid_file}")
+    now=$(date +%s)
+    duration=$((${now} - ${starttime}))
+    if [ "${duration}" -ge 60 ] || [ -f "${save_file}" ] || [ -f "${pause_file}" ] || [ "${termination_request}" = 1 ] || [ ! -d "${vid_dir}" ]
+    then
+      state=killing
+    elif [ ! -d "/proc/$(cat "${pid_file}")" ]
+    then
+      state=waiting
+    else
+      state=recording
+      find "${vid_dir}" -name "${recent_prefix}*" -type f -mmin +60 -delete
+    fi
+    sleep 1
+  ;;
+  killing)
+    kill -SIGINT "$(cat ${pid_file})"
+    wait "$(cat ${pid_file})" || true
+    rm -Rf "${this_filename}"
+    mv "${scratch_file}" "${this_filename}"
+    if [ "${termination_request}" = 1 ]
+    then
+      logger -t ${log_tag} "shutting down."
+      ${ui_unavailable} || true
+      rm -Rf "${scratch_file}"
+      exit 143 #128+15 -- SIGTERM
+    fi
+    state=paused
+    ${ui_available} || true
+  ;;
+  esac
+
+  if [ "$old_state" != "$state" ] ; then
+    logger -t "${log_tag}" "State transitioned from $old_state to $state"
+  fi
+  echo "${state}" > "${state_file}"
+done

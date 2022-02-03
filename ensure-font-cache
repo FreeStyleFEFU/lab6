@@ -1,0 +1,47 @@
+#!/bin/bash
+# ensure font-cache is present and updated
+
+FONT_CACHE_NEEDS_UPDATED=false
+FC_UPDATED_SENTINEL_FILE="/var/cache/tesla-fontconfig-updated"
+NEW_FC_CACHE_PATH="/usr/tesla/UI/bin/fc-cache"
+
+FC_CACHE_COMMAND="fc-cache" && [ -x $NEW_FC_CACHE_PATH ] && FC_CACHE_COMMAND=$NEW_FC_CACHE_PATH
+FC_FLAGS="-rf"
+
+OPTIONAL_FONT_DIR="$TESLA_HOME/.fonts"
+
+# If we have the new fc-cache and the version 7 font cache files don't exist yet, update the cache.
+if [ -x $NEW_FC_CACHE_PATH ] && ! ls /var/cache/fontconfig/*.cache-7 1> /dev/null 2>&1
+then
+    logger "font cache needs updated because new version hasn't run yet"
+    FONT_CACHE_NEEDS_UPDATED=true
+fi
+
+# If the sentinel file does not exist, software update wants the font cache updated.
+if [ ! -f $FC_UPDATED_SENTINEL_FILE ]
+then
+    logger "font cache needs updated because software update removed the sentinel file"
+    FONT_CACHE_NEEDS_UPDATED=true
+fi
+
+# If the font cache does not need updated, then exit early.
+if [ $FONT_CACHE_NEEDS_UPDATED = false ]
+then
+    exit 0
+fi
+
+logger "updating font-cache with $FC_CACHE_COMMAND $FC_FLAGS"
+
+$FC_CACHE_COMMAND $FC_FLAGS || exit 1
+
+if [ -d $OPTIONAL_FONT_DIR ]
+then
+    logger "updating optional fonts in $OPTIONAL_FONT_DIR"
+    $FC_CACHE_COMMAND $FC_FLAGS $OPTIONAL_FONT_DIR || exit 1
+fi
+
+touch $FC_UPDATED_SENTINEL_FILE
+
+logger "done updating font-cache"
+
+exit 0

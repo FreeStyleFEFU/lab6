@@ -1,0 +1,60 @@
+#!/bin/bash
+
+# Process diagnostics tool
+# When the resource is dire, remember to trim the fat...
+# https://en.wikipedia.org/wiki/Margaret_Hamilton_(scientist)
+#
+# This process shall run as root
+#
+# Usage:
+# ./lowmem_diag PID SERVICE_NAME
+
+. /etc/tesla.env
+
+set -o nounset
+
+log()
+{
+    logger -p "user.$1" -s -t "lowmem_diag" -- "$2"
+}
+
+cleanup_old_directories()
+{
+    find "$1" -type d -ctime +7 -exec rm -rf {} \;
+}
+
+PID="$1"
+SERVICE_NAME="$2"
+
+DEV_CAR_DETECT="/usr/bin/is-development-car"
+
+# On Tegra, this script is at /usr/local/bin
+if [[ -x "/usr/local/bin/is-development-car" ]] ; then
+  DEV_CAR_DETECT="/usr/local/bin/is-development-car"
+fi
+
+if ! "$DEV_CAR_DETECT" ; then
+  log error "Hamilton diagnostic service was requested on $SERVICE_NAME due to low memory. It was refused because this is not a dev car."
+  exit 1
+fi
+
+DIAGDIR="/home/root/.lowmem_diags"
+
+mkdir -p "$DIAGDIR"
+cleanup_old_directories "$DIAGDIR"
+
+SECONDS=$(date +%s)
+TIMESTAMP=$(date --date="@$SECONDS" +%Y%m%d%H%M%S)
+
+DATEDIR=$(date --date="@$SECONDS" +%Y%m%d)
+
+mkdir -p "$DIAGDIR/$DATEDIR"
+
+DIAGFILE="$DIAGDIR/$DATEDIR/$2_$TIMESTAMP.log"
+
+for i in stat statm status smaps ; do
+  # keep the headers the same to make it easier to find/grep
+  echo "== /proc/pid/$i ==" >> "$DIAGFILE"
+  cat "/proc/$PID/$i" >> "$DIAGFILE"
+done
+
